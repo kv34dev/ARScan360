@@ -76,79 +76,70 @@ final class HandTrackingAR {
     private func updateVisualization(for observations: [VNHumanHandPoseObservation], frame: ARFrame) {
         guard let arView = arView else { return }
 
-        // Размер view для конвертации нормализованных координат в экранные точки
-        let view = arView.superview ?? arView
         let viewSize = arView.bounds.size
 
-        // Обновляем / создаём anchor и joint entities для каждой обнаруженной руки
         for (handIndex, observation) in observations.enumerated() {
-            // ensure anchor exists
             let anchorEntity: AnchorEntity
             if let existing = handAnchors[handIndex] {
                 anchorEntity = existing
             } else {
-                // создаём anchor, который мы будем перемещать в world space
                 anchorEntity = AnchorEntity(world: SIMD3<Float>(0,0,0))
                 anchorEntity.name = "handAnchor_\(handIndex)"
                 handAnchors[handIndex] = anchorEntity
                 arView.scene.addAnchor(anchorEntity)
             }
 
-            // ensure joint entities dictionary exists
             if jointEntities[handIndex] == nil {
                 jointEntities[handIndex] = [:]
             }
 
-            // получаем все точки
             guard let recognizedPoints = try? observation.recognizedPoints(.all) else { continue }
 
-            // Для каждого joint: вычисляем экранную точку, пробуем raycast, обновляем позицию sphere
+            // Для каждого joint
             for joint in fingerJoints {
-                guard let point = recognizedPoints[joint], point.confidence > 0.2 else {
-                    // если точка не достоверна — скрываем соответствующую сущность (если была)
-                    if let ent = jointEntities[handIndex]?[joint] {
-                        ent.isEnabled = false
-                    }
+                guard let point = recognizedPoints[joint], point.confidence > 0.3 else {
+                    jointEntities[handIndex]?[joint]?.isEnabled = false
                     continue
                 }
 
-                // Vision coords: origin bottom-left. Screen coords (UIKit): origin top-left.
                 let normalized = CGPoint(x: CGFloat(point.location.x), y: CGFloat(point.location.y))
-                let screenPoint = CGPoint(x: normalized.x * viewSize.width, y: (1.0 - normalized.y) * viewSize.height)
+                let screenPoint = CGPoint(x: normalized.x * viewSize.width,
+                                          y: (1.0 - normalized.y) * viewSize.height)
 
-                // Попробуем получить 3D-точку через raycast (по экранной точке)
-                var worldPositionOptional: SIMD3<Float>? = nil
-                if let result = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any).first {
-                    worldPositionOptional = result.worldTransform.translation
-                } else if let cameraTransform = arView.session.currentFrame?.camera.transform {
-                    // fallback: расположим точку на фиксированном расстоянии перед камерой
-                    let forward = -simd_normalize(cameraTransform.columns.2.xyz) // камера смотрит -Z
-                    let cameraPos = cameraTransform.translation
-                    let distance: Float = 0.5 // 50 cm in front
-                    worldPositionOptional = cameraPos + forward * distance
-                }
+                // Получаем позицию камеры
+                guard let cameraTransform = arView.session.currentFrame?.camera.transform else { continue }
+                let cameraPos = cameraTransform.translation
+                let forward = -simd_normalize(cameraTransform.columns.2.xyz)
 
-                guard let worldPosition = worldPositionOptional else { continue }
+                // Расстояние от камеры до руки (примерно 0.4 м)
+                let distance: Float = 0.4
 
-                // create or update entity for joint
+                // Вычисляем положение в 3D относительно центра экрана
+                let offsetX = Float((screenPoint.x / viewSize.width) - 0.5) * distance
+                let offsetY = Float((screenPoint.y / viewSize.height) - 0.5) * distance
+                let worldPos = cameraPos + forward * distance + SIMD3<Float>(offsetX, -offsetY, 0)
+
                 let jointEntity: ModelEntity
                 if let existing = jointEntities[handIndex]?[joint] {
                     jointEntity = existing
                     jointEntity.isEnabled = true
                 } else {
-                    let mesh = MeshResource.generateSphere(radius: 0.008) // чуть побольше чтобы было видно
-                    let mat = SimpleMaterial(color: .systemRed, roughness: 0.4, isMetallic: false)
+                    let mesh = MeshResource.generateSphere(radius: 0.007)
+                    let mat = SimpleMaterial(color: .green, roughness: 0.4, isMetallic: false)
                     jointEntity = ModelEntity(mesh: mesh, materials: [mat])
                     jointEntity.generateCollisionShapes(recursive: false)
                     jointEntities[handIndex]?[joint] = jointEntity
                     anchorEntity.addChild(jointEntity)
                 }
 
-                jointEntity.position = worldPosition - anchorEntity.position // local position relative to anchor
+                // Плавное движение
+                let lerpFactor: Float = 0.2
+                let currentPos = jointEntity.position(relativeTo: anchorEntity)
+                jointEntity.position = simd_mix(currentPos, worldPos - anchorEntity.position, SIMD3<Float>(repeating: lerpFactor))
             }
         }
 
-        // Удаляем лишние anchor'ы, если рук стало меньше
+        // Удаляем лишние руки
         let observedCount = observations.count
         for (index, anchor) in handAnchors {
             if index >= observedCount {
