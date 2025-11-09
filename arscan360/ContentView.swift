@@ -9,7 +9,7 @@ struct ContentView: View {
                 .edgesIgnoringSafeArea(.all)
             VStack(spacing: 8) {
                 HStack {
-                    Text("LiDAR Scan • точная постановка")
+                    Text("LiDAR Scan")
                         .font(.system(size: 14, weight: .semibold))
                     Spacer()
                 }
@@ -24,7 +24,7 @@ struct ContentView: View {
 
 struct ScanOverlay: View {
     // Communicates via NotificationCenter (simple)
-    @State private var stateText: String = "Ожидание..."
+    @State private var stateText: String = "Waiting..."
     @State private var anchorsCount: Int = 0
 
     var body: some View {
