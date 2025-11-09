@@ -22,7 +22,7 @@ struct LiDARARViewContainer: UIViewRepresentable {
         // запуск
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
-        // установка делегата сессии для получения anchor updates
+        // установка делегата сессии для получения anchor updates (Coordinator)
         arView.session.delegate = context.coordinator
 
         // тап-жест для размещения
@@ -31,6 +31,9 @@ struct LiDARARViewContainer: UIViewRepresentable {
 
         // удобное отображение для отладки: показать feature points
         arView.debugOptions.insert(.showFeaturePoints)
+
+        // инициализируем hand tracker один раз (не делегатом сессии)
+        context.coordinator.handTracker = HandTrackingAR(arView: arView)
 
         // подписка на переключение режима сканирования
         NotificationCenter.default.addObserver(context.coordinator,
@@ -49,6 +52,26 @@ struct LiDARARViewContainer: UIViewRepresentable {
     class Coordinator: NSObject, ARSessionDelegate {
         weak var arView: ARView?
         private var scanningEnabled: Bool = true
+
+        // hand tracker (инициализируется в makeUIView)
+        var handTracker: HandTrackingAR?
+
+        // MARK: - ARSessionDelegate
+        func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            // обновление состояния сканирования / счетчика mesh anchors
+            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
+
+            // передаём кадр в hand tracker (он выполнит throttled Vision обработку)
+            handTracker?.process(frame: frame)
+        }
+
+        func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
+        }
+
+        func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
+        }
 
         // handleTap: raycast against existing mesh geometry -> place object
         @objc func handleTap(_ sender: UITapGestureRecognizer) {
@@ -77,7 +100,7 @@ struct LiDARARViewContainer: UIViewRepresentable {
             let anchor = AnchorEntity(world: transform)
             let size: Float = 0.12
             let box = ModelEntity(mesh: .generateBox(size: size),
-                                  materials: [SimpleMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 1.0), isMetallic: false)]) //CUBE COLOR
+                                  materials: [SimpleMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 1.0), isMetallic: false)]) // CUBE COLOR
             box.generateCollisionShapes(recursive: true)
             anchor.addChild(box)
             arView.scene.addAnchor(anchor)
@@ -114,17 +137,6 @@ struct LiDARARViewContainer: UIViewRepresentable {
                 arView.session.run(config, options: [])
                 updateScanStateUI(state: "Scan paused", anchorsCount: currentMeshAnchorCount())
             }
-        }
-
-        // MARK: - ARSessionDelegate: наблюдаем за anchors (mesh anchors)
-        func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
-        }
-        func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
-        }
-        func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
         }
 
         // helper
