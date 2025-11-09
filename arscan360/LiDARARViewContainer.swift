@@ -77,7 +77,7 @@ struct LiDARARViewContainer: UIViewRepresentable {
             let anchor = AnchorEntity(world: transform)
             let size: Float = 0.12
             let box = ModelEntity(mesh: .generateBox(size: size),
-                                  materials: [SimpleMaterial(color: UIColor(red: 0.9, green: 0.45, blue: 0.15, alpha: 1.0), isMetallic: false)])
+                                  materials: [SimpleMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 1.0), isMetallic: false)]) //CUBE COLOR
             box.generateCollisionShapes(recursive: true)
             anchor.addChild(box)
             arView.scene.addAnchor(anchor)
