@@ -3,8 +3,6 @@ import ARKit
 import Vision
 import UIKit
 
-/// HandTrackingAR — не является ARSessionDelegate.
-/// Coordinator будет вызывать process(frame:) каждый кадр.
 final class HandTrackingAR {
 
     // MARK: - Config
@@ -12,11 +10,9 @@ final class HandTrackingAR {
     private let handPoseRequest = VNDetectHumanHandPoseRequest()
     private let processingQueue = DispatchQueue(label: "com.example.handtracking.queue", qos: .userInitiated)
 
-    // throttle: минимальный интервал между Vision вызовами (сек)
-    private let minInterval: TimeInterval = 0.1 // ~10 FPS
+    private let minInterval: TimeInterval = 0.1
     private var lastProcessed: TimeInterval = 0
 
-    // joints we track
     private let fingerJoints: [VNHumanHandPoseObservation.JointName] = [
         .wrist,
         .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
@@ -26,56 +22,50 @@ final class HandTrackingAR {
         .littleMCP, .littlePIP, .littleDIP, .littleTip
     ]
 
-    // reuse entities: one anchor per detected hand, with sphere entities for joints
-    // keys: handIndex (0..n)
     private var handAnchors: [Int: AnchorEntity] = [:]
     private var jointEntities: [Int: [VNHumanHandPoseObservation.JointName: ModelEntity]] = [:]
+    private var lineEntities: [Int: [String: ModelEntity]] = [:] // ключ = "joint1_joint2"
 
     init(arView: ARView) {
         self.arView = arView
-        handPoseRequest.maximumHandCount = 2 // поддерживаем до 2-х рук
+        handPoseRequest.maximumHandCount = 2
     }
 
-    // MARK: - Public: вызывается из Coordinator.session(_:didUpdate:)
     func process(frame: ARFrame) {
         let now = Date().timeIntervalSince1970
-        if now - lastProcessed < minInterval { return } // throttle
+        if now - lastProcessed < minInterval { return }
         lastProcessed = now
 
-        // Копируем pixel buffer для безопасной работы в фоне
         let pixelBuffer = frame.capturedImage
+        let interfaceOrientation =
+            UIApplication.shared.connectedScenes
+                .compactMap { ($0 as? UIWindowScene)?.interfaceOrientation }
+                .first ?? .portrait
 
-        // Выполняем Vision на фоне
+        let orientation = CGImagePropertyOrientation(interfaceOrientation: interfaceOrientation)
+
         processingQueue.async { [weak self] in
             guard let self = self else { return }
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                                orientation: .up,
+                                                orientation: orientation,
                                                 options: [:])
             do {
                 try handler.perform([self.handPoseRequest])
                 guard let observations = self.handPoseRequest.results, !observations.isEmpty else {
-                    // если рук нет — удалим сущности на главном потоке
-                    DispatchQueue.main.async {
-                        self.clearHandEntities()
-                    }
+                    DispatchQueue.main.async { self.clearHandEntities() }
                     return
                 }
-                // Обновляем визуализацию на главном потоке
                 DispatchQueue.main.async {
                     self.updateVisualization(for: observations, frame: frame)
                 }
             } catch {
-                // не ломаем main thread
-                // можно логировать
                 // print("Hand pose error: \(error)")
             }
         }
     }
 
-    // MARK: - Visualization helpers (main thread)
     private func updateVisualization(for observations: [VNHumanHandPoseObservation], frame: ARFrame) {
         guard let arView = arView else { return }
-
         let viewSize = arView.bounds.size
 
         for (handIndex, observation) in observations.enumerated() {
@@ -83,19 +73,19 @@ final class HandTrackingAR {
             if let existing = handAnchors[handIndex] {
                 anchorEntity = existing
             } else {
-                anchorEntity = AnchorEntity(world: SIMD3<Float>(0,0,0))
+                anchorEntity = AnchorEntity(world: SIMD3<Float>(0, 0, 0))
                 anchorEntity.name = "handAnchor_\(handIndex)"
                 handAnchors[handIndex] = anchorEntity
                 arView.scene.addAnchor(anchorEntity)
             }
 
-            if jointEntities[handIndex] == nil {
-                jointEntities[handIndex] = [:]
-            }
+            if jointEntities[handIndex] == nil { jointEntities[handIndex] = [:] }
+            if lineEntities[handIndex] == nil { lineEntities[handIndex] = [:] }
 
             guard let recognizedPoints = try? observation.recognizedPoints(.all) else { continue }
 
-            // Для каждого joint
+            var jointWorldPositions: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
+
             for joint in fingerJoints {
                 guard let point = recognizedPoints[joint], point.confidence > 0.3 else {
                     jointEntities[handIndex]?[joint]?.isEnabled = false
@@ -106,70 +96,92 @@ final class HandTrackingAR {
                 let screenPoint = CGPoint(x: normalized.x * viewSize.width,
                                           y: (1.0 - normalized.y) * viewSize.height)
 
-                // Получаем позицию камеры
-                guard let cameraTransform = arView.session.currentFrame?.camera.transform else { continue }
-                let cameraPos = cameraTransform.translation
-                let forward = -simd_normalize(cameraTransform.columns.2.xyz)
+                guard let ray = arView.ray(through: screenPoint) else { continue }
 
-                // Расстояние от камеры до руки (примерно 0.4 м)
+                // "протягиваем" 40 см вглубь
                 let distance: Float = 0.4
-
-                // Вычисляем положение в 3D относительно центра экрана
-                let offsetX = Float((screenPoint.x / viewSize.width) - 0.5) * distance
-                let offsetY = Float((screenPoint.y / viewSize.height) - 0.5) * distance
-                let worldPos = cameraPos + forward * distance + SIMD3<Float>(offsetX, -offsetY, 0)
+                let worldPos = ray.origin + ray.direction * distance
+                jointWorldPositions[joint] = worldPos
 
                 let jointEntity: ModelEntity
                 if let existing = jointEntities[handIndex]?[joint] {
                     jointEntity = existing
                     jointEntity.isEnabled = true
                 } else {
-                    let mesh = MeshResource.generateSphere(radius: 0.007)
+                    let mesh = MeshResource.generateSphere(radius: 0.000)   //SPHERE SIZE
                     let mat = SimpleMaterial(color: .green, roughness: 0.4, isMetallic: false)
                     jointEntity = ModelEntity(mesh: mesh, materials: [mat])
-                    jointEntity.generateCollisionShapes(recursive: false)
                     jointEntities[handIndex]?[joint] = jointEntity
                     anchorEntity.addChild(jointEntity)
                 }
 
-                // Плавное движение
-                let lerpFactor: Float = 0.2
+                let lerpFactor: Float = 0.25
                 let currentPos = jointEntity.position(relativeTo: anchorEntity)
                 jointEntity.position = simd_mix(currentPos, worldPos - anchorEntity.position, SIMD3<Float>(repeating: lerpFactor))
             }
-        }
 
-        // Удаляем лишние руки
-        let observedCount = observations.count
-        for (index, anchor) in handAnchors {
-            if index >= observedCount {
-                anchor.removeFromParent()
-                handAnchors.removeValue(forKey: index)
-                jointEntities.removeValue(forKey: index)
+            // соединения суставов в виде линий
+            let fingers: [[VNHumanHandPoseObservation.JointName]] = [
+                [.wrist, .thumbCMC, .thumbMP, .thumbIP, .thumbTip],
+                [.wrist, .indexMCP, .indexPIP, .indexDIP, .indexTip],
+                [.wrist, .middleMCP, .middlePIP, .middleDIP, .middleTip],
+                [.wrist, .ringMCP, .ringPIP, .ringDIP, .ringTip],
+                [.wrist, .littleMCP, .littlePIP, .littleDIP, .littleTip]
+            ]
+
+            for finger in fingers {
+                for i in 0..<(finger.count - 1) {
+                    let j1 = finger[i], j2 = finger[i + 1]
+                    guard let p1 = jointWorldPositions[j1], let p2 = jointWorldPositions[j2] else { continue }
+                    let key = "\(j1.rawValue)_\(j2.rawValue)"
+
+                    let lineEntity: ModelEntity
+                    if let existing = lineEntities[handIndex]?[key] {
+                        lineEntity = existing
+                    } else {
+                        let mesh = MeshResource.generateBox(size: SIMD3<Float>(0.002, 0.002, 0.1))  //LINE SIZE
+                        let mat = SimpleMaterial(color: .green, roughness: 0.3, isMetallic: false)
+                        lineEntity = ModelEntity(mesh: mesh, materials: [mat])
+                        lineEntities[handIndex]?[key] = lineEntity
+                        anchorEntity.addChild(lineEntity)
+                    }
+
+                    let middle = (p1 + p2) / 2
+                    let direction = simd_normalize(p2 - p1)
+                    let distance = simd_length(p2 - p1)
+
+                    lineEntity.position = middle - anchorEntity.position
+                    lineEntity.scale = SIMD3<Float>(repeating: 1)
+                    lineEntity.scale.z = distance / 0.1
+                    lineEntity.orientation = simd_quatf(from: [0, 0, 1], to: direction)
+                }
             }
         }
     }
 
-    // MARK: - Utility
     private func clearHandEntities() {
-        for (_, anchor) in handAnchors {
-            anchor.removeFromParent()
-        }
+        for (_, anchor) in handAnchors { anchor.removeFromParent() }
         handAnchors.removeAll()
         jointEntities.removeAll()
+        lineEntities.removeAll()
     }
 }
 
-// MARK: - SIMD helpers
 fileprivate extension simd_float4x4 {
-    var translation: SIMD3<Float> {
-        return SIMD3(columns.3.x, columns.3.y, columns.3.z)
-    }
+    var translation: SIMD3<Float> { SIMD3(columns.3.x, columns.3.y, columns.3.z) }
 }
-
 fileprivate extension simd_float4 {
-    var xyz: SIMD3<Float> {
-        SIMD3(x, y, z)
-    }
+    var xyz: SIMD3<Float> { SIMD3(x, y, z) }
 }
 
+// MARK: - Orientation fix for Vision
+extension CGImagePropertyOrientation {
+    init(interfaceOrientation: UIInterfaceOrientation) {
+        switch interfaceOrientation {
+        case .portraitUpsideDown: self = .left
+        case .landscapeLeft: self = .up
+        case .landscapeRight: self = .down
+        default: self = .right
+        }
+    }
+}
