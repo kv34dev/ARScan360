@@ -68,5 +68,8 @@
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
+    
+    <key>NSCameraUsageDescription</key>
+    <string>Camera is required for hand tracking in AR</string>
 </dict>
 </plist>
