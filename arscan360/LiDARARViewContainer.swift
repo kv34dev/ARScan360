@@ -1,6 +1,7 @@
 import SwiftUI
 import RealityKit
 import ARKit
+import Vision
 
 struct LiDARARViewContainer: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -9,40 +10,30 @@ struct LiDARARViewContainer: UIViewRepresentable {
         let arView = ARView(frame: .zero)
         context.coordinator.arView = arView
 
-        // настройка сессии: worldTracking + mesh reconstruction
-        let config = ARWorldTrackingConfiguration()
-        config.planeDetection = []
+        // Используем ARWorldTrackingConfiguration (поддерживает sceneReconstruction и frameSemantics)
+        let worldConfig = ARWorldTrackingConfiguration()
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
+            worldConfig.sceneReconstruction = .mesh
         }
-        // семантика глубины для улучшений (если поддерживается)
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            config.frameSemantics.insert(.sceneDepth)
+            worldConfig.frameSemantics.insert(.sceneDepth)
         }
-        // запуск
-        arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        // Запускаем сессии
+        arView.session.run(worldConfig, options: [.resetTracking, .removeExistingAnchors])
 
-        // установка делегата сессии для получения anchor updates (Coordinator)
+        // Делегат — Coordinator
         arView.session.delegate = context.coordinator
 
-        // тап-жест для размещения
+        // Инициализация трекеров (Hand + Body). Они НЕ становятся делегатами сессии.
+        context.coordinator.handTracker = HandTrackingAR(arView: arView)
+        context.coordinator.bodyTracker = BodyTrackingAR(arView: arView)
+
+        // Debug options (удали, если не нужно)
+        arView.debugOptions = [.showFeaturePoints, .showAnchorOrigins]
+
+        // Tap gesture для размещения куба
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
         arView.addGestureRecognizer(tap)
-
-        // удобное отображение для отладки: показать feature points
-        arView.debugOptions.insert(.showFeaturePoints)
-
-        // инициализируем hand tracker один раз (не делегатом сессии)
-        context.coordinator.handTracker = HandTrackingAR(arView: arView)
-
-        // подписка на переключение режима сканирования
-        NotificationCenter.default.addObserver(context.coordinator,
-                                               selector: #selector(Coordinator.toggleScanMode),
-                                               name: .toggleScanMode,
-                                               object: nil)
-
-        // инициализация UI state
-        context.coordinator.updateScanStateUI(state: "Scanning...", anchorsCount: 0)
 
         return arView
     }
@@ -51,103 +42,77 @@ struct LiDARARViewContainer: UIViewRepresentable {
 
     class Coordinator: NSObject, ARSessionDelegate {
         weak var arView: ARView?
-        private var scanningEnabled: Bool = true
 
-        // hand tracker (инициализируется в makeUIView)
+        // Trackers (инициализируются в makeUIView)
         var handTracker: HandTrackingAR?
+        var bodyTracker: BodyTrackingAR?
+
+        private var scanningEnabled = true
 
         // MARK: - ARSessionDelegate
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // обновление состояния сканирования / счетчика mesh anchors
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
-
-            // передаём кадр в hand tracker (он выполнит throttled Vision обработку)
+            // Передаём кадр обоим трекерам (они сами throttling'уют обработку)
             handTracker?.process(frame: frame)
+            bodyTracker?.process(frame: frame)
+
+            // При желании — здесь можно обновлять UI (через NotificationCenter) о состоянии сканирования, etc.
         }
 
+        // Optional: handle anchors added/removed (e.g. mesh anchors). Можно обновлять UI счётчик.
         func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
+            // example: handle mesh anchors if needed
+        }
+        func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {}
+        func session(_ session: ARSession, didFailWithError error: Error) {
+            print("ARSession failed: \(error)")
         }
 
-        func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-            updateScanStateUI(state: scanningEnabled ? "Scanning..." : "Paused", anchorsCount: currentMeshAnchorCount())
-        }
-
-        // handleTap: raycast against existing mesh geometry -> place object
+        // MARK: - Tap: place a cube by raycast
         @objc func handleTap(_ sender: UITapGestureRecognizer) {
             guard let arView = arView else { return }
-            let loc = sender.location(in: arView)
+            let point = sender.location(in: arView)
 
-            // сначала пробуем raycast против существующей геометрии меша
-            if let result = arView.raycast(from: loc, allowing: .existingPlaneGeometry, alignment: .any).first {
-                placeObject(at: result.worldTransform)
+            // Try precise mesh geometry first, then estimated plane
+            if let result = arView.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .any).first {
+                placeCube(at: result.worldTransform, in: arView)
                 return
             }
-            // fallback: estimated plane (если mesh не доступен в этой точке)
-            if let result2 = arView.raycast(from: loc, allowing: .estimatedPlane, alignment: .any).first {
-                placeObject(at: result2.worldTransform)
+            if let result = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any).first {
+                placeCube(at: result.worldTransform, in: arView)
                 return
             }
 
-            // если ничего не найдено — можно уведомить пользователя
-            updateScanStateUI(state: "No surface found at tap", anchorsCount: currentMeshAnchorCount())
+            // fallback: place 0.5m in front of camera
+            if let cameraTransform = arView.session.currentFrame?.camera.transform {
+                let t = cameraTransform
+                let forward = simd_normalize(t.forward3)
+                let pos = t.position3 + forward * 0.5
+
+                var mat = matrix_identity_float4x4
+                mat.columns.3 = SIMD4<Float>(pos.x, pos.y, pos.z, 1)
+                placeCube(at: mat, in: arView)
+            }
+
         }
 
-        // размещение объекта: небольшой куб + жесты
-        private func placeObject(at transform: simd_float4x4) {
-            guard let arView = arView else { return }
-
+        private func placeCube(at transform: simd_float4x4, in arView: ARView) {
             let anchor = AnchorEntity(world: transform)
             let size: Float = 0.12
             let box = ModelEntity(mesh: .generateBox(size: size),
-                                  materials: [SimpleMaterial(color: UIColor(red: 0, green: 1, blue: 0, alpha: 1.0), isMetallic: false)]) // CUBE COLOR
+                                  materials: [SimpleMaterial(color: .green, isMetallic: false)])
             box.generateCollisionShapes(recursive: true)
             anchor.addChild(box)
             arView.scene.addAnchor(anchor)
-
-            // устанавливаем жесты RealityKit (перемещение/вращение/масштаб)
             arView.installGestures([.translation, .rotation, .scale], for: box)
-
-            updateScanStateUI(state: "Object placed", anchorsCount: currentMeshAnchorCount())
-
-            NotificationCenter.default.post(name: .placedObjectInfo, object: nil, userInfo: ["transform": transform])
         }
+    }
+}
+extension simd_float4x4 {
+    var position3: SIMD3<Float> {
+        SIMD3<Float>(columns.3.x, columns.3.y, columns.3.z)
+    }
 
-        // переключение режима сканирования
-        @objc func toggleScanMode() {
-            scanningEnabled.toggle()
-            guard let arView = arView else { return }
-
-            if scanningEnabled {
-                let config = ARWorldTrackingConfiguration()
-                if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-                    config.sceneReconstruction = .mesh
-                }
-                if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-                    config.frameSemantics.insert(.sceneDepth)
-                }
-                arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-                updateScanStateUI(state: "Scanning...", anchorsCount: currentMeshAnchorCount())
-            } else {
-                let config = ARWorldTrackingConfiguration()
-                // убираем sceneReconstruction
-                if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-                    config.frameSemantics.remove(.sceneDepth)
-                }
-                arView.session.run(config, options: [])
-                updateScanStateUI(state: "Scan paused", anchorsCount: currentMeshAnchorCount())
-            }
-        }
-
-        // helper
-        func currentMeshAnchorCount() -> Int {
-            guard let arView = arView else { return 0 }
-            let anchors = arView.session.currentFrame?.anchors ?? []
-            return anchors.reduce(0) { $0 + ( $1 is ARMeshAnchor ? 1 : 0 ) }
-        }
-
-        func updateScanStateUI(state: String, anchorsCount: Int) {
-            NotificationCenter.default.post(name: .scanStateUpdate, object: nil, userInfo: ["state": state, "anchorsCount": anchorsCount])
-        }
+    var forward3: SIMD3<Float> {
+        SIMD3<Float>(-columns.2.x, -columns.2.y, -columns.2.z)
     }
 }
