@@ -71,5 +71,8 @@
     
     <key>NSCameraUsageDescription</key>
     <string>Camera is required for hand tracking in AR</string>
+    
+    <key>NSCameraUsageDescription</key>
+    <string>Camera is required for AR and pose detection.</string>
 </dict>
 </plist>
