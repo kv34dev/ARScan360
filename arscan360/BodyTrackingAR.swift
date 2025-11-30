@@ -67,7 +67,7 @@ final class BodyTrackingAR {
             }
         }
 
-        // Точки тела, которые используем
+        // Points for the joints we care about, in the order specified in the image (e.g., shoulders, knees, etc.)
         let joints: [VNHumanBodyPoseObservation.JointName] = [
             .neck, .root,
             .rightShoulder, .rightElbow, .rightWrist,
@@ -76,7 +76,7 @@ final class BodyTrackingAR {
             .leftHip, .leftKnee, .leftAnkle
         ]
 
-        // Соединения между суставами (для линий)
+        // Updated connections for body parts based on your image (red arrows)
         let connections: [(VNHumanBodyPoseObservation.JointName, VNHumanBodyPoseObservation.JointName)] = [
             (.neck, .rightShoulder), (.neck, .leftShoulder),
             (.rightShoulder, .rightElbow), (.rightElbow, .rightWrist),
@@ -84,10 +84,10 @@ final class BodyTrackingAR {
             (.root, .rightHip), (.root, .leftHip),
             (.rightHip, .rightKnee), (.rightKnee, .rightAnkle),
             (.leftHip, .leftKnee), (.leftKnee, .leftAnkle),
-            (.neck, .root)
+            (.neck, .root) // Head to torso
         ]
 
-        // создаём / обновляем точки
+        // Create or update joint entities
         for joint in joints {
             guard let point = recognizedPoints[joint], point.confidence > 0.2 else {
                 jointEntities[joint]?.isEnabled = false
@@ -103,7 +103,7 @@ final class BodyTrackingAR {
             guard let cameraTransform = arView.session.currentFrame?.camera.transform else { continue }
             let cameraPos = cameraTransform.translation
             let forward = -simd_normalize(cameraTransform.columns.2.xyz)
-            let distance: Float = 1.2 // тело дальше, чем руки
+            let distance: Float = 1.2 // Body is farther away than arms
             let offsetX = Float((screenPoint.x / viewSize.width) - 0.5) * distance
             let offsetY = Float((screenPoint.y / viewSize.height) - 0.5) * distance
             let worldPos = cameraPos + forward * distance + SIMD3<Float>(offsetX, -offsetY, 0)
@@ -113,7 +113,7 @@ final class BodyTrackingAR {
                 jointEntity = existing
                 jointEntity.isEnabled = true
             } else {
-                let mesh = MeshResource.generateSphere(radius: 0.01)   //SPHERE SIZE
+                let mesh = MeshResource.generateSphere(radius: 0.01) // Sphere size for joints
                 let mat = SimpleMaterial(color: .green, roughness: 0.4, isMetallic: false)
                 jointEntity = ModelEntity(mesh: mesh, materials: [mat])
                 jointEntities[joint] = jointEntity
@@ -123,11 +123,11 @@ final class BodyTrackingAR {
             jointEntity.position = worldPos - (bodyAnchor?.position ?? .zero)
         }
 
-        // удаляем старые линии
+        // Remove old lines
         lineEntities.forEach { $0.removeFromParent() }
         lineEntities.removeAll()
 
-        // создаём новые линии
+        // Create new lines between the joints, following the connections defined above
         for (a, b) in connections {
             if let jointA = jointEntities[a], let jointB = jointEntities[b],
                jointA.isEnabled, jointB.isEnabled {
@@ -138,10 +138,12 @@ final class BodyTrackingAR {
                 let length = simd_length(direction)
                 let mid = (start + end) / 2
 
+                // Create line mesh
                 let lineMesh = MeshResource.generateBox(size: [0.005, 0.005, length])
                 let mat = SimpleMaterial(color: .green, isMetallic: false)
                 let lineEntity = ModelEntity(mesh: lineMesh, materials: [mat])
 
+                // Position and orient the line
                 lineEntity.position = mid
                 lineEntity.look(at: end, from: mid, relativeTo: bodyAnchor)
                 bodyAnchor?.addChild(lineEntity)
@@ -149,6 +151,7 @@ final class BodyTrackingAR {
             }
         }
     }
+
 
     private func clearBody() {
         bodyAnchor?.removeFromParent()
